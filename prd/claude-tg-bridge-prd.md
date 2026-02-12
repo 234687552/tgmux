@@ -229,7 +229,8 @@ tgmux/
 # ~/.tgmux/config.yaml
 telegram:
   token: "your-bot-token"
-
+  allowed_users:
+    - 123456789
 backends:
   claude:
     command: "claude"        # 启动命令，可自定义参数
