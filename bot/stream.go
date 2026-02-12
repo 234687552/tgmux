@@ -2,7 +2,6 @@ package bot
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"math/rand"
 	"strings"
@@ -44,7 +43,7 @@ func (r *RateLimiter) Wait(ctx context.Context) error {
 	}
 }
 
-// BackOff sets the global pause until time with exponential backoff + jitter
+// BackOff sets the global pause until time with jitter
 func (r *RateLimiter) BackOff(retryAfterSec int) {
 	if retryAfterSec <= 0 {
 		retryAfterSec = 1
@@ -52,50 +51,50 @@ func (r *RateLimiter) BackOff(retryAfterSec int) {
 	if retryAfterSec > 30 {
 		retryAfterSec = 30
 	}
-	// Add jitter +/-20%
 	jitter := float64(retryAfterSec) * (0.8 + rand.Float64()*0.4)
 	until := time.Now().Add(time.Duration(jitter*1000) * time.Millisecond).UnixMilli()
 	r.pauseUntil.Store(until)
 }
 
-// StreamPusher manages streaming output to a Telegram chat via editMessage
+// MessageTask represents a single message to send to Telegram
+type MessageTask struct {
+	Text        string
+	ContentType monitor.ContentType
+}
+
+// StreamPusher sends messages to a Telegram chat via a FIFO queue.
+// Each message is sent as a new Telegram message (no editMessage).
 type StreamPusher struct {
 	chatID      int64
 	threadID    int
 	tgBot       *tgbot.Bot
 	rateLimiter *RateLimiter
 	redact      bool
-	throttle    time.Duration // group: 3s, private: 1s
 
-	mu            sync.Mutex
-	buffer        string // overlay buffer for current streaming message
-	dirty         bool
-	currentMsgID  int    // current message being edited
-	currentText   string // current text in the message
-	finalQueue    []string
-	cancel        context.CancelFunc
-	wg            sync.WaitGroup
+	queue  chan MessageTask
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
 }
 
-func NewStreamPusher(chatID int64, threadID int, tgBot *tgbot.Bot, rl *RateLimiter, redact bool, throttle time.Duration) *StreamPusher {
+func NewStreamPusher(chatID int64, threadID int, tgBot *tgbot.Bot, rl *RateLimiter, redact bool) *StreamPusher {
 	return &StreamPusher{
 		chatID:      chatID,
 		threadID:    threadID,
 		tgBot:       tgBot,
 		rateLimiter: rl,
 		redact:      redact,
-		throttle:    throttle,
+		queue:       make(chan MessageTask, 100),
 	}
 }
 
-// Start begins the push loop
+// Start begins the queue worker
 func (p *StreamPusher) Start(ctx context.Context) {
 	ctx, p.cancel = context.WithCancel(ctx)
 	p.wg.Add(1)
-	go p.pushLoop(ctx)
+	go p.worker(ctx)
 }
 
-// Stop stops the push loop and flushes remaining content
+// Stop cancels the worker and waits for it to drain
 func (p *StreamPusher) Stop() {
 	if p.cancel != nil {
 		p.cancel()
@@ -103,197 +102,75 @@ func (p *StreamPusher) Stop() {
 	p.wg.Wait()
 }
 
-// Push adds new content to the buffer
-func (p *StreamPusher) Push(text string) {
-	if text == "" {
-		return
-	}
-	p.mu.Lock()
-	if p.currentText != "" {
-		p.buffer = p.currentText + "\n" + text
-	} else {
-		if p.buffer != "" {
-			p.buffer = p.buffer + "\n" + text
-		} else {
-			p.buffer = text
-		}
-	}
-	p.dirty = true
-	p.mu.Unlock()
-}
-
-// Finalize sends the current content as a final message (no more edits)
-func (p *StreamPusher) Finalize(text string) {
-	p.mu.Lock()
-	if text != "" {
-		p.finalQueue = append(p.finalQueue, text)
-	}
-	if len(p.finalQueue) > 5 {
-		// Cap at 5, summarize
-		skipped := len(p.finalQueue) - 5
-		p.finalQueue = p.finalQueue[skipped:]
-		p.finalQueue = append([]string{fmt.Sprintf("[已省略 %d 条中间输出]", skipped)}, p.finalQueue...)
-	}
-	p.mu.Unlock()
-}
-
-// Flush sends all pending content immediately
-func (p *StreamPusher) Flush(ctx context.Context) {
-	p.mu.Lock()
-	buf := p.buffer
-	dirty := p.dirty
-	finals := p.finalQueue
-	p.buffer = ""
-	p.dirty = false
-	p.finalQueue = nil
-	p.mu.Unlock()
-
-	if dirty && buf != "" {
-		p.sendOrEdit(ctx, buf)
-	}
-	for _, text := range finals {
-		p.sendNew(ctx, text)
+// Enqueue adds a message task to the queue
+func (p *StreamPusher) Enqueue(task MessageTask) {
+	select {
+	case p.queue <- task:
+	default:
+		slog.Warn("message queue full, dropping", "chat", p.chatID)
 	}
 }
 
-func (p *StreamPusher) pushLoop(ctx context.Context) {
+func (p *StreamPusher) worker(ctx context.Context) {
 	defer p.wg.Done()
-	ticker := time.NewTicker(p.throttle)
-	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			// Final flush
-			flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			p.Flush(flushCtx)
-			cancel()
+			// Drain remaining messages
+			p.drain()
 			return
+		case task := <-p.queue:
+			p.sendMessage(ctx, task)
+		}
+	}
+}
 
-		case <-ticker.C:
-			p.mu.Lock()
-			buf := p.buffer
-			dirty := p.dirty
-			finals := p.finalQueue
-			p.buffer = ""
-			p.dirty = false
-			p.finalQueue = nil
-			p.mu.Unlock()
+func (p *StreamPusher) drain() {
+	drainCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for {
+		select {
+		case task := <-p.queue:
+			p.sendMessage(drainCtx, task)
+		default:
+			return
+		}
+	}
+}
 
-			// Send finalized messages first
-			for _, text := range finals {
-				p.sendNew(ctx, text)
+func (p *StreamPusher) sendMessage(ctx context.Context, task MessageTask) {
+	text := sanitize.Redact(task.Text, p.redact)
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	// Split long messages
+	chunks := splitMessage(text, 4096)
+	for _, chunk := range chunks {
+		if err := p.rateLimiter.Wait(ctx); err != nil {
+			return
+		}
+
+		params := &tgbot.SendMessageParams{
+			ChatID: p.chatID,
+			Text:   chunk,
+		}
+		if p.threadID != 0 {
+			params.MessageThreadID = p.threadID
+		}
+
+		resp, err := p.tgBot.SendMessage(ctx, params)
+		if err != nil {
+			if is429(err) {
+				p.rateLimiter.BackOff(1)
+				slog.Warn("429 on sendMessage", "chat", p.chatID)
+			} else {
+				slog.Error("sendMessage failed", "error", err)
 			}
-
-			if dirty && buf != "" {
-				p.sendOrEdit(ctx, buf)
-			}
+			return
 		}
+		slog.Info("message sent", "chat", p.chatID, "msgID", resp.ID, "textLen", len(chunk), "type", task.ContentType)
 	}
-}
-
-func (p *StreamPusher) sendOrEdit(ctx context.Context, text string) {
-	text = sanitize.Redact(text, p.redact)
-
-	// Check if we need to split (>3800 chars)
-	if len(text) > 3800 {
-		splitIdx := findCodeBlockBoundary(text, 3800)
-		first := text[:splitIdx]
-		rest := text[splitIdx:]
-
-		// Finalize current message with first part
-		if p.currentMsgID > 0 {
-			p.editMessage(ctx, first)
-		} else {
-			p.sendNew(ctx, first)
-		}
-		// Start new message for the rest
-		p.currentMsgID = 0
-		p.currentText = ""
-		p.mu.Lock()
-		p.buffer = rest
-		p.dirty = true
-		p.mu.Unlock()
-		return
-	}
-
-	if p.currentMsgID > 0 {
-		p.editMessage(ctx, text)
-	} else {
-		p.sendNew(ctx, text)
-	}
-}
-
-func (p *StreamPusher) sendNew(ctx context.Context, text string) {
-	text = sanitize.Redact(text, p.redact)
-	if text == "" {
-		return
-	}
-	if len(text) > 4096 {
-		text = text[:4096]
-	}
-
-	if err := p.rateLimiter.Wait(ctx); err != nil {
-		return
-	}
-
-	params := &tgbot.SendMessageParams{
-		ChatID: p.chatID,
-		Text:   text,
-	}
-	if p.threadID != 0 {
-		params.MessageThreadID = p.threadID
-	}
-
-	resp, err := p.tgBot.SendMessage(ctx, params)
-	if err != nil {
-		if is429(err) {
-			p.rateLimiter.BackOff(1)
-			slog.Warn("429 on sendMessage", "chat", p.chatID)
-		} else {
-			slog.Error("sendMessage failed", "error", err)
-		}
-		return
-	}
-
-	p.mu.Lock()
-	p.currentMsgID = resp.ID
-	p.currentText = text
-	p.mu.Unlock()
-}
-
-func (p *StreamPusher) editMessage(ctx context.Context, text string) {
-	if text == "" || text == p.currentText {
-		return
-	}
-	if len(text) > 4096 {
-		text = text[:4096]
-	}
-
-	if err := p.rateLimiter.Wait(ctx); err != nil {
-		return
-	}
-
-	params := &tgbot.EditMessageTextParams{
-		ChatID:    p.chatID,
-		MessageID: p.currentMsgID,
-		Text:      text,
-	}
-
-	_, err := p.tgBot.EditMessageText(ctx, params)
-	if err != nil {
-		if is429(err) {
-			p.rateLimiter.BackOff(2)
-			slog.Warn("429 on editMessage", "chat", p.chatID)
-		} else {
-			slog.Warn("editMessage failed", "error", err)
-		}
-		return
-	}
-
-	p.mu.Lock()
-	p.currentText = text
-	p.mu.Unlock()
 }
 
 // is429 checks if error is a Telegram 429 rate limit error
@@ -304,17 +181,34 @@ func is429(err error) bool {
 	return strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests")
 }
 
-// findCodeBlockBoundary finds a good split point near maxLen respecting code blocks
-func findCodeBlockBoundary(text string, maxLen int) int {
+// splitMessage splits text into chunks fitting Telegram's limit, preferring newline boundaries
+func splitMessage(text string, maxLen int) []string {
+	if len(text) <= maxLen {
+		return []string{text}
+	}
+	var chunks []string
+	for len(text) > maxLen {
+		splitIdx := findSplitPoint(text, maxLen)
+		chunks = append(chunks, text[:splitIdx])
+		text = text[splitIdx:]
+	}
+	if len(text) > 0 {
+		chunks = append(chunks, text)
+	}
+	return chunks
+}
+
+// findSplitPoint finds a good split point near maxLen respecting code blocks and newlines
+func findSplitPoint(text string, maxLen int) int {
 	if maxLen >= len(text) {
 		return len(text)
 	}
 
-	// Look for last ``` before maxLen
 	sub := text[:maxLen]
+
+	// Look for last ``` before maxLen
 	lastFence := strings.LastIndex(sub, "```")
 	if lastFence > maxLen/2 {
-		// Find the end of this code block line
 		nlIdx := strings.Index(text[lastFence:], "\n")
 		if nlIdx >= 0 {
 			return lastFence + nlIdx + 1
@@ -331,39 +225,26 @@ func findCodeBlockBoundary(text string, maxLen int) int {
 	return maxLen
 }
 
-// ensureClosedCodeBlocks ensures markdown code blocks are properly closed
-func ensureClosedCodeBlocks(text string) string {
-	count := strings.Count(text, "```")
-	if count%2 != 0 {
-		text += "\n```"
-	}
-	return text
-}
-
 // PusherManager manages all active StreamPushers
 type PusherManager struct {
-	mu       sync.Mutex
-	pushers  map[string]*StreamPusher // topicKey -> StreamPusher
-	tgBot    *tgbot.Bot
-	rl       *RateLimiter
-	redact   bool
-	groupThr time.Duration
-	privThr  time.Duration
+	mu      sync.Mutex
+	pushers map[string]*StreamPusher
+	tgBot   *tgbot.Bot
+	rl      *RateLimiter
+	redact  bool
 }
 
-func NewPusherManager(tgBot *tgbot.Bot, redact bool, groupThrottle, privateThrottle time.Duration) *PusherManager {
+func NewPusherManager(tgBot *tgbot.Bot, redact bool) *PusherManager {
 	return &PusherManager{
-		pushers:  make(map[string]*StreamPusher),
-		tgBot:    tgBot,
-		rl:       NewRateLimiter(),
-		redact:   redact,
-		groupThr: groupThrottle,
-		privThr:  privateThrottle,
+		pushers: make(map[string]*StreamPusher),
+		tgBot:   tgBot,
+		rl:      NewRateLimiter(),
+		redact:  redact,
 	}
 }
 
 // GetOrCreate returns existing pusher or creates a new one
-func (pm *PusherManager) GetOrCreate(ctx context.Context, topicKey string, chatID int64, threadID int, isPrivate bool) *StreamPusher {
+func (pm *PusherManager) GetOrCreate(ctx context.Context, topicKey string, chatID int64, threadID int) *StreamPusher {
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
 
@@ -371,12 +252,7 @@ func (pm *PusherManager) GetOrCreate(ctx context.Context, topicKey string, chatI
 		return p
 	}
 
-	throttle := pm.groupThr
-	if isPrivate {
-		throttle = pm.privThr
-	}
-
-	p := NewStreamPusher(chatID, threadID, pm.tgBot, pm.rl, pm.redact, throttle)
+	p := NewStreamPusher(chatID, threadID, pm.tgBot, pm.rl, pm.redact)
 	p.Start(ctx)
 	pm.pushers[topicKey] = p
 	return p
@@ -395,19 +271,8 @@ func (pm *PusherManager) StopPusher(topicKey string) {
 	}
 }
 
-// FlushAll flushes all active pushers
-func (pm *PusherManager) FlushAll(ctx context.Context) {
-	pm.mu.Lock()
-	all := make(map[string]*StreamPusher, len(pm.pushers))
-	for k, v := range pm.pushers {
-		all[k] = v
-	}
-	pm.mu.Unlock()
-
-	for _, p := range all {
-		p.Flush(ctx)
-	}
-}
+// FlushAll is a no-op for queue-based pushers (drain happens in Stop)
+func (pm *PusherManager) FlushAll(ctx context.Context) {}
 
 // StopAll stops all active pushers
 func (pm *PusherManager) StopAll() {
@@ -426,7 +291,7 @@ func (pm *PusherManager) StopAll() {
 
 // OutputHandler returns a monitor.OutputHandler that routes to the correct pusher
 func (pm *PusherManager) OutputHandler(ctx context.Context, topicKey string, chatID int64, threadID int, isPrivate bool, windowID string) monitor.OutputHandler {
-	return func(key string, text string) {
+	return func(key string, text string, contentType monitor.ContentType) {
 		// Check for confirm prompts and send keyboard
 		if monitor.DetectConfirmPrompt(text) {
 			kb := ConfirmKeyboard(windowID)
@@ -441,7 +306,13 @@ func (pm *PusherManager) OutputHandler(ctx context.Context, topicKey string, cha
 			pm.tgBot.SendMessage(ctx, params)
 		}
 
-		p := pm.GetOrCreate(ctx, topicKey, chatID, threadID, isPrivate)
-		p.Push(text)
+		p := pm.GetOrCreate(ctx, topicKey, chatID, threadID)
+
+		switch contentType {
+		case monitor.ContentThinking:
+			p.Enqueue(MessageTask{Text: "💭 " + text, ContentType: contentType})
+		case monitor.ContentText:
+			p.Enqueue(MessageTask{Text: text, ContentType: contentType})
+		}
 	}
 }

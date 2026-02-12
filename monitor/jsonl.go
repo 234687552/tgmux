@@ -20,17 +20,18 @@ import (
 
 // JSONLMonitor 通过 fsnotify 监听日志目录，增量读取 JSONL 文件
 type JSONLMonitor struct {
-	topicKey     string
-	backendType  backend.Type
-	logDir       string
-	byteOffset   int64
-	currentFile  string
-	handler      OutputHandler
-	store        *state.Store
-	cancel       context.CancelFunc
-	mu           sync.Mutex
-	watchedPaths map[string]struct{}
-	parseErrors  int
+	topicKey      string
+	backendType   backend.Type
+	logDir        string
+	byteOffset    int64
+	currentFile   string
+	handler       OutputHandler
+	store         *state.Store
+	cancel        context.CancelFunc
+	mu            sync.Mutex
+	watchedPaths  map[string]struct{}
+	parseErrors   int
+	baselineFiles map[string]struct{} // 启动时已存在的文件（仅新会话使用）
 }
 
 func NewJSONLMonitor(topicKey string, bt backend.Type, logDir string, byteOffset int64, currentFile string, handler OutputHandler, store *state.Store) *JSONLMonitor {
@@ -84,8 +85,22 @@ func (m *JSONLMonitor) Start(ctx context.Context) error {
 		}
 	}
 
+	// 始终记录已有文件作为基线，防止切换到其他 Claude 会话的文件
+	m.baselineFiles = m.listExistingJSONLFiles()
 	if m.currentFile == "" {
-		m.currentFile = m.findLatestJSONL()
+		// 新会话：等待新文件创建
+		slog.Info("JSONL monitor waiting for new file", "key", m.topicKey, "baseline_count", len(m.baselineFiles))
+	} else {
+		// 恢复会话：验证保存的文件存在
+		if _, err := os.Stat(m.currentFile); err != nil {
+			slog.Warn("saved JSONL file not found, resetting", "key", m.topicKey, "file", m.currentFile)
+			m.currentFile = ""
+			m.byteOffset = 0
+		} else {
+			// 保存的文件有效 → 从基线中移除它，允许 WRITE 事件触发读取
+			delete(m.baselineFiles, m.currentFile)
+			slog.Info("JSONL monitor resuming", "key", m.topicKey, "file", filepath.Base(m.currentFile), "offset", m.byteOffset)
+		}
 	}
 
 	ctx, m.cancel = context.WithCancel(ctx)
@@ -147,18 +162,28 @@ func (m *JSONLMonitor) handleEvent(watcher *fsnotify.Watcher, event fsnotify.Eve
 			return
 		}
 		if isJSONLFile(event.Name, m.backendType) {
+			if m.baselineFiles != nil {
+				if _, known := m.baselineFiles[event.Name]; known {
+					return // 忽略基线内的已有文件
+				}
+			}
 			m.switchFile(event.Name)
 		}
 	}
 
 	if event.Has(fsnotify.Write) {
 		if isJSONLFile(event.Name, m.backendType) {
-			if event.Name != m.currentFile {
-				latest := m.findLatestJSONL()
-				if latest != "" && latest != m.currentFile {
-					m.switchFile(latest)
+			if m.currentFile == "" {
+				// 新会话尚未锁定文件：只接受不在基线中的文件
+				if m.baselineFiles != nil {
+					if _, known := m.baselineFiles[event.Name]; known {
+						return
+					}
 				}
+				m.switchFile(event.Name)
 			}
+			// WRITE 事件只处理当前文件，不切换到其他文件
+			// 文件切换只通过 CREATE 事件触发，避免误读其他 Claude 会话
 			if event.Name == m.currentFile {
 				m.readIncremental()
 			}
@@ -196,15 +221,15 @@ func (m *JSONLMonitor) readIncremental() {
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 256*1024), 1024*1024)
 
-	var texts []string
+	var outputs []ParsedContent
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
 			continue
 		}
-		text := m.parseLine(line)
-		if text != "" {
-			texts = append(texts, text)
+		contents := m.parseLine(line)
+		outputs = append(outputs, contents...)
+		if len(contents) > 0 {
 			m.parseErrors = 0
 		}
 	}
@@ -217,63 +242,88 @@ func (m *JSONLMonitor) readIncremental() {
 		ByteOffset: m.byteOffset,
 	})
 
-	if len(texts) > 0 {
-		combined := strings.Join(texts, "\n")
-		m.handler(m.topicKey, combined)
+	// 逐块发送，保持原始顺序（thinking → text → thinking → text）
+	for _, c := range outputs {
+		switch c.Type {
+		case ContentThinking:
+			slog.Info("JSONL thinking output", "key", m.topicKey, "len", len(c.Text))
+			m.handler(m.topicKey, c.Text, ContentThinking)
+		case ContentText:
+			slog.Info("JSONL answer output", "key", m.topicKey, "preview", truncate(c.Text, 80))
+			m.handler(m.topicKey, c.Text, ContentText)
+		}
 	}
 }
 
-func (m *JSONLMonitor) parseLine(line string) string {
+// ParsedContent 解析后的内容块
+type ParsedContent struct {
+	Type ContentType
+	Text string
+}
+
+func (m *JSONLMonitor) parseLine(line string) []ParsedContent {
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(line), &raw); err != nil {
 		m.parseErrors++
 		if m.parseErrors >= 3 {
 			slog.Warn("too many parse errors", "key", m.topicKey, "errors", m.parseErrors)
 		}
-		return ""
+		return nil
 	}
 
 	switch m.backendType {
 	case backend.TypeClaude:
 		return parseClaudeLine(raw)
 	case backend.TypeCodex:
-		return parseCodexLine(raw)
+		text := parseCodexLine(raw)
+		if text != "" {
+			return []ParsedContent{{Type: ContentText, Text: text}}
+		}
+		return nil
 	default:
-		return ""
+		return nil
 	}
 }
 
-func parseClaudeLine(raw map[string]json.RawMessage) string {
+func parseClaudeLine(raw map[string]json.RawMessage) []ParsedContent {
 	var msgType string
 	if t, ok := raw["type"]; ok {
 		json.Unmarshal(t, &msgType)
 	}
 	if msgType != "assistant" {
-		return ""
+		return nil
 	}
 
 	msgData, ok := raw["message"]
 	if !ok {
-		return ""
+		return nil
 	}
 
 	var msg struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking"`
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(msgData, &msg); err != nil {
-		return ""
+		return nil
 	}
 
-	var texts []string
+	var results []ParsedContent
 	for _, c := range msg.Content {
-		if c.Type == "text" && c.Text != "" {
-			texts = append(texts, c.Text)
+		switch c.Type {
+		case "thinking":
+			if c.Thinking != "" {
+				results = append(results, ParsedContent{Type: ContentThinking, Text: c.Thinking})
+			}
+		case "text":
+			if c.Text != "" {
+				results = append(results, ParsedContent{Type: ContentText, Text: c.Text})
+			}
 		}
 	}
-	return strings.Join(texts, "\n")
+	return results
 }
 
 func parseCodexLine(raw map[string]json.RawMessage) string {
@@ -324,6 +374,21 @@ func parseCodexLine(raw map[string]json.RawMessage) string {
 
 func (m *JSONLMonitor) findLatestJSONL() string {
 	return findLatestFile(m.logDir, m.backendType)
+}
+
+// listExistingJSONLFiles 列出日志目录中所有已存在的 JSONL 文件
+func (m *JSONLMonitor) listExistingJSONLFiles() map[string]struct{} {
+	files := make(map[string]struct{})
+	filepath.Walk(m.logDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if isJSONLFile(path, m.backendType) {
+			files[path] = struct{}{}
+		}
+		return nil
+	})
+	return files
 }
 
 func findLatestFile(dir string, bt backend.Type) string {
@@ -402,4 +467,12 @@ func (m *JSONLMonitor) checkDateChange(watcher *fsnotify.Watcher) {
 	if _, err := os.Stat(todayDir); err == nil {
 		m.addDirWatch(watcher, todayDir)
 	}
+}
+
+func truncate(s string, maxLen int) string {
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	if len(s) > maxLen {
+		return s[:maxLen] + "..."
+	}
+	return s
 }

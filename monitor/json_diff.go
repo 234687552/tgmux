@@ -110,7 +110,7 @@ func (m *JSONDiffMonitor) loop(ctx context.Context, watcher *fsnotify.Watcher) {
 			slog.Error("gemini watcher error", "key", m.topicKey, "error", err)
 		case <-timeout.C:
 			slog.Warn("gemini hash dir detection timeout", "key", m.topicKey)
-			m.handler(m.topicKey, "无法定位 Gemini 日志目录，已切换为终端捕获模式")
+			m.handler(m.topicKey, "无法定位 Gemini 日志目录，已切换为终端捕获模式", ContentText)
 			return
 		}
 	}
@@ -175,7 +175,7 @@ func (m *JSONDiffMonitor) readAndDiff() {
 			MessageCount: m.lastMessageID,
 		})
 		combined := strings.Join(newTexts, "\n")
-		m.handler(m.topicKey, combined)
+		m.handler(m.topicKey, combined, ContentText)
 	}
 }
 

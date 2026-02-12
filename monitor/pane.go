@@ -73,7 +73,7 @@ func (p *PaneMonitor) poll() {
 	p.lastSnapshot = current
 
 	if newContent != "" {
-		p.handler(p.topicKey, newContent)
+		p.handler(p.topicKey, newContent, ContentText)
 	}
 }
 

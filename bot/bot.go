@@ -60,7 +60,7 @@ func New(cfg *config.Config, store *state.Store, tmuxMgr *tmux.Manager, authChec
 		return nil, fmt.Errorf("create bot: %w", err)
 	}
 	b.bot = tgBot
-	b.pushers = NewPusherManager(tgBot, cfg.Security.RedactSecrets, cfg.Monitor.GroupThrottle, cfg.Monitor.PrivateThrottle)
+	b.pushers = NewPusherManager(tgBot, cfg.Security.RedactSecrets)
 
 	// 注册命令
 	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/new", bot.MatchTypeExact, b.handleNew)

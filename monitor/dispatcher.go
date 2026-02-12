@@ -13,8 +13,16 @@ import (
 	"github.com/user/tgmux/tmux"
 )
 
+// ContentType 区分输出内容类型
+type ContentType int
+
+const (
+	ContentText     ContentType = iota // 普通文本/最终答案
+	ContentThinking                    // 思考过程
+)
+
 // OutputHandler 输出回调
-type OutputHandler func(topicKey string, text string)
+type OutputHandler func(topicKey string, text string, contentType ContentType)
 
 // Monitor 输出监控接口
 type Monitor interface {
