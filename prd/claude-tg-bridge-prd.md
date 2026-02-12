@@ -4,6 +4,10 @@
 
 通过 Telegram Bot + Topic 远程控制本地 tmux 中的多种 AI 编程助手会话（Claude Code / Codex / Gemini / bash），Go 实现，可选 Web UI。
 
+## 竞品参考
+
+已有高度相似的开源项目 [six-ddc/ccbot](https://github.com/six-ddc/ccbot)，功能与 tgmux 重合度高（Telegram Topic 映射 tmux 窗口、实时推送、内联键盘权限确认等）。tgmux 的差异化定位：**多后端统一管理**（Claude Code / Codex / Gemini / bash），而非仅支持 Claude Code。
+
 ## 核心架构
 
 ```
@@ -16,6 +20,8 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 
 **映射关系**: 1 Topic（或 1 对 1 私聊）= 1 tmux window = 1 后端会话（backend + 项目目录）
 
+> 注意：私聊没有 Topic 概念，仅能绑定一个会话。多会话需使用群组 Topic 模式。
+
 ## 交互流程
 
 ### 消息处理（私聊 / 群聊 / Topic 统一）
@@ -23,11 +29,17 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 ```
 用户发送消息
   ↓
+鉴权检查（allowed_users 白名单，不在白名单内静默丢弃）
+  ↓
 按 chat_id 或 topic_id 查绑定
   ↓
 ┌─ 已绑定 ─────────────────────────────────────┐
-│  转发到绑定的 tmux 窗口，正常交互               │
+│  检查 tmux 窗口是否存活                        │
+│  ├─ 存活 → 转发到绑定的 tmux 窗口，正常交互    │
+│  └─ 已死 → 提示"会话已断开"，自动解绑，         │
+│           进入未绑定流程                        │
 ├─ 未绑定 ─────────────────────────────────────┤
+│  提示："该 Topic 尚未绑定会话"                  │
 │  检查 tmux 中已有窗口                          │
 │  ┌─ 有已有会话 ────────────────────────┐      │
 │  │  [claude @ my-project     (@0)]    │      │
@@ -35,7 +47,7 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 │  │  ──────────────────────────        │      │
 │  │  [➕ 新建会话]                      │      │
 │  │                                     │      │
-│  │  选已有 → 绑定，转发原始消息          │      │
+│  │  选已有 → 绑定（不自动转发原始消息）  │      │
 │  │  选新建 → /new 流程                 │      │
 │  ├─ 无已有会话 ────────────────────────┤      │
 │  │  直接进入 /new 流程                 │      │
@@ -45,26 +57,36 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 
 ### `/new` 新建会话
 
+采用两步交互，降低单次认知负担：
+
 ```
 触发 /new
   ↓
-一次性发送两组内联键盘：
-
+状态标记为 awaiting_dir
+  ↓
+第一步：选择项目目录（一条消息）
 ┌─ 📂 选择项目目录 ─────────────────┐
 │ [~/project-a]        (最近使用)    │
 │ [~/project-b]        (收藏)        │
 │ [📁 输入路径...]                   │
-├─ 🚀 启动命令 ─────────────────────┤
+└───────────────────────────────────┘
+
+  ↓ 用户选择目录（或输入路径，此时状态为 awaiting_path_input，
+  ↓ 下一条文本消息作为路径，不触发绑定流程）
+状态标记为 awaiting_backend
+  ↓
+第二步：选择后端（第二条消息）
+┌─ 🚀 选择启动命令 ─────────────────┐
 │ [claude] [codex] [gemini] [bash]  │
 └───────────────────────────────────┘
 
-  ↓
-两项都选完后触发创建（已选项高亮）
-  ↓
+  ↓ 用户选择后端
 创建 tmux 窗口 → cd 目录 → 启动命令 → 绑定
   ↓
 ✅ 已创建 claude 会话 @ ~/project-a
 ```
+
+**状态机定义**：`idle` → `awaiting_dir` → `awaiting_path_input`（可选）→ `awaiting_backend` → `bound`
 
 
 
@@ -72,10 +94,17 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 
 | 后端 | tmux 内启动命令 | 日志路径 | 输出监控方式 |
 |---|---|---|---|
-| `claude` | `claude` 或 `claude --dangerously-skip-permissions` | `~/.claude/projects/<hash>/<session>.jsonl` | JSONL 文件监控 |
-| `codex` | `codex` | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` | JSONL 文件监控 |
-| `gemini` | `gemini` | `~/.gemini/tmp/<hash>/chats/` | JSON 文件监控 |
+| `claude` | `claude` | `~/.claude/projects/<path-encoded>/` 目录下最新 `.jsonl` 文件 | JSONL 增量读取（fsnotify 监听目录） |
+| `codex` | `codex` | `~/.codex/sessions/YYYY/MM/DD/` 目录下最新 `rollout-*.jsonl` | JSONL 增量读取（fsnotify 监听目录） |
+| `gemini` | `gemini` | `~/.gemini/tmp/<hash>/chats/` 目录下最新 `.json` 文件 | JSON 全量解析 + diff（非 JSONL，每次全量重写） |
 | `bash` | 直接进入 shell | 无 | tmux capture-pane 轮询 |
+
+> **日志路径说明**：
+> - Claude 的 `<path-encoded>` 是项目绝对路径的 `/` 替换为 `-` 并去掉开头 `-`，如 `/Users/foo/project` → `Users-foo-project`
+> - 启动后端后无法预知具体 session 文件名（UUID），需监听整个目录，按 mtime 取最新文件
+> - Gemini 的 chat 文件是完整 JSON 而非 JSONL，不能用 byte_offset 增量读取，需每次解析整个 JSON 后 diff messages 数组
+> - 这些路径是各工具的内部实现细节，无稳定性保证，应作为可配置项，允许用户覆盖
+> - 当日志文件监控失败时，自动降级到 capture-pane 轮询
 
 不同后端统一通过 tmux send-keys 发送输入。AI 工具优先使用日志文件监控（更精准），bash 使用 capture-pane 轮询兜底。
 
@@ -86,7 +115,7 @@ Telegram Topic D ──┘    Web UI (可选)   └── tmux window @4 ── 
 | 语言 | Go | 单二进制部署，并发原生支持 |
 | Telegram SDK | [go-telegram/bot](https://github.com/go-telegram/bot) | Telegram 官网推荐，零依赖，支持 Bot API 9.4，活跃维护 |
 | tmux 交互 | exec.Command 调用 tmux CLI | 简单可靠，无需 cgo |
-| 会话监控 | fsnotify + 日志文件 / capture-pane 轮询 | AI 工具用日志文件监控，bash 用 capture-pane |
+| 会话监控 | fsnotify + 日志文件 / capture-pane 轮询 | AI 工具用日志目录监控（注意：监听目录而非单文件，避免 macOS 原子保存导致监视丢失），bash 用 capture-pane |
 | Web UI | 内嵌 embed.FS + WebSocket | 单二进制，可通过配置关闭 |
 | 配置 | YAML 单文件 | ~/.tgmux/config.yaml |
 | 状态持久化 | JSON 文件 | ~/.tgmux/state.json |
