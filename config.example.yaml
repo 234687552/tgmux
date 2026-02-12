@@ -1,0 +1,40 @@
+# ~/.tgmux/config.yaml
+telegram:
+  token: "your-bot-token"       # 或通过环境变量 TGMUX_BOT_TOKEN 覆盖
+  allowed_users:                 # 必填，为空则拒绝启动
+    - 123456789
+
+backends:
+  claude:
+    command: "claude"
+    args: []
+    log_dir_pattern: "~/.claude/projects/{path_encoded}/"
+  codex:
+    command: "codex"
+    args: []
+    log_dir_pattern: "~/.codex/sessions/{date}/"
+  gemini:
+    command: "gemini"
+    args: []
+    log_dir_pattern: "~/.gemini/tmp/{hash}/"
+  bash:
+    command: ""
+    enabled: true
+
+dirs:
+  favorites: []
+  recent_max: 10
+
+security:
+  redact_secrets: true
+  config_permission_check: true
+
+web:
+  enabled: false
+  port: 3030
+  bind: "127.0.0.1"
+
+monitor:
+  poll_interval: 500ms
+  group_throttle: 3000ms
+  private_throttle: 1000ms

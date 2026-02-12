@@ -24,3 +24,8 @@ pnpm-debug.log*
 .idea/
 tmp/
 .omc/
+
+# Go specific
+bin/
+*.exe
+vendor/
