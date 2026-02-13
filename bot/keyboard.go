@@ -75,6 +75,60 @@ func ConfirmKeyboard(windowID string) models.InlineKeyboardMarkup {
 	}
 }
 
+// ScreenshotKeyboard 截图控制键盘
+func ScreenshotKeyboard(windowID string) models.InlineKeyboardMarkup {
+	return models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "⬆", CallbackData: fmt.Sprintf("ss:up:%s", windowID)},
+				{Text: "⬇", CallbackData: fmt.Sprintf("ss:down:%s", windowID)},
+				{Text: "⬅", CallbackData: fmt.Sprintf("ss:left:%s", windowID)},
+				{Text: "➡", CallbackData: fmt.Sprintf("ss:right:%s", windowID)},
+			},
+			{
+				{Text: "Enter", CallbackData: fmt.Sprintf("ss:enter:%s", windowID)},
+				{Text: "Esc", CallbackData: fmt.Sprintf("ss:esc:%s", windowID)},
+				{Text: "Tab", CallbackData: fmt.Sprintf("ss:tab:%s", windowID)},
+				{Text: "Space", CallbackData: fmt.Sprintf("ss:space:%s", windowID)},
+			},
+			{
+				{Text: "Ctrl-C", CallbackData: fmt.Sprintf("ss:ctrlc:%s", windowID)},
+				{Text: "y", CallbackData: fmt.Sprintf("ss:y:%s", windowID)},
+				{Text: "n", CallbackData: fmt.Sprintf("ss:n:%s", windowID)},
+				{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("ss:refresh:%s", windowID)},
+			},
+		},
+	}
+}
+
+// InteractiveKeyboard 交互式界面导航键盘
+func InteractiveKeyboard(windowID string) models.InlineKeyboardMarkup {
+	return models.InlineKeyboardMarkup{
+		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "⬆ Up", CallbackData: fmt.Sprintf("nav:up:%s", windowID)},
+				{Text: "⬇ Down", CallbackData: fmt.Sprintf("nav:down:%s", windowID)},
+				{Text: "⬅ Left", CallbackData: fmt.Sprintf("nav:left:%s", windowID)},
+				{Text: "➡ Right", CallbackData: fmt.Sprintf("nav:right:%s", windowID)},
+			},
+			{
+				{Text: "Space", CallbackData: fmt.Sprintf("nav:space:%s", windowID)},
+				{Text: "Tab", CallbackData: fmt.Sprintf("nav:tab:%s", windowID)},
+				{Text: "Enter", CallbackData: fmt.Sprintf("nav:enter:%s", windowID)},
+			},
+			{
+				{Text: "Esc", CallbackData: fmt.Sprintf("nav:esc:%s", windowID)},
+				{Text: "🔄 Refresh", CallbackData: fmt.Sprintf("nav:refresh:%s", windowID)},
+			},
+			{
+				{Text: "✅ Yes", CallbackData: fmt.Sprintf("confirm:yes:%s", windowID)},
+				{Text: "❌ No", CallbackData: fmt.Sprintf("confirm:no:%s", windowID)},
+				{Text: "🔓 Always", CallbackData: fmt.Sprintf("confirm:always:%s", windowID)},
+			},
+		},
+	}
+}
+
 // SessionListKeyboard 会话列表键盘（含绑定/关闭按钮）
 func SessionListKeyboard(sessions []SessionInfo) models.InlineKeyboardMarkup {
 	var rows [][]models.InlineKeyboardButton

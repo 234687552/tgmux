@@ -38,3 +38,7 @@ monitor:
   poll_interval: 500ms
   group_throttle: 3000ms
   private_throttle: 1000ms
+  # 终端状态轮询间隔。轮询 tmux pane 最后一行（spinner/提示符）并在 Telegram 中编辑展示。
+  # 仅对 JSONL 监控的后端（claude/codex/gemini）生效，bash 后端已有 PaneMonitor 不需要。
+  # 设为 0 或不配置则不启动状态轮询。
+  # status_poll_interval: 1000ms

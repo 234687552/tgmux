@@ -16,9 +16,19 @@ import (
 	"github.com/user/tgmux/state"
 )
 
-// defaultHandler 处理非命令的文本消息
+// defaultHandler 处理非命令的文本消息（也接收未匹配的 /命令，会自动转发到 tmux）
 func (b *Bot) defaultHandler(ctx context.Context, tgBot *bot.Bot, update *models.Update) {
-	if update.Message == nil || update.Message.Text == "" {
+	if update.Message == nil {
+		return
+	}
+
+	// 论坛话题关闭事件 - 自动清理关联的 tmux 窗口
+	if update.Message.ForumTopicClosed != nil {
+		b.handleTopicClosed(ctx, update.Message)
+		return
+	}
+
+	if update.Message.Text == "" {
 		return
 	}
 	msg := update.Message
@@ -68,18 +78,32 @@ func (b *Bot) defaultHandler(ctx context.Context, tgBot *bot.Bot, update *models
 		// 已绑定 - 检查窗口是否存活
 		if !b.tmux.IsWindowAlive(binding.WindowID) {
 			// 窗口已死 - 自动解绑
-			b.store.DeleteBinding(key)
-			b.store.DeleteOffset(key)
-			b.closeSendChan(binding.WindowID)
-			b.dispatcher.StopMonitor(key)
-			b.pushers.StopPusher(key)
+			b.unbind(key, binding)
 			slog.Info("window dead, auto unbinding", "key", key, "window", binding.WindowID)
 			b.sendReply(ctx, msg, "⚠️ 会话已断开，已自动解绑")
-			// 进入未绑定流程
 			b.handleUnbound(ctx, msg, key)
 			return
 		}
-		// 窗口存活 - 转发消息到 tmux
+		// 窗口存活但后端进程可能已退出（回到 shell）
+		if !b.tmux.IsBackendAlive(binding.WindowID) {
+			b.unbind(key, binding)
+			slog.Info("backend exited, auto unbinding", "key", key, "window", binding.WindowID)
+			b.sendReply(ctx, msg, "⚠️ 后端进程已退出，已自动解绑")
+			b.handleUnbound(ctx, msg, key)
+			return
+		}
+		// ! 前缀：直接发送 bash 命令到 tmux pane（绕过 AI 后端输入队列）
+		if strings.HasPrefix(text, "!") && len(text) > 1 {
+			cmdText := strings.TrimSpace(text[1:])
+			if err := b.tmux.SendKeys(binding.WindowID, cmdText); err != nil {
+				b.sendReply(ctx, msg, fmt.Sprintf("发送命令失败: %v", err))
+				return
+			}
+			b.tmux.SendEnter(binding.WindowID)
+			return
+		}
+
+		// 窗口和后端都存活 - 转发消息到 tmux
 		ch := b.getOrCreateSendChan(binding.WindowID)
 		ch <- text
 		return
@@ -206,12 +230,7 @@ func (b *Bot) handleKill(ctx context.Context, tgBot *bot.Bot, update *models.Upd
 	}
 	// 关闭窗口
 	b.tmux.KillWindow(binding.WindowID)
-	b.closeSendChan(binding.WindowID)
-	b.dispatcher.StopMonitor(key)
-	b.pushers.StopPusher(key)
-	b.store.DeleteBinding(key)
-	b.store.DeleteOffset(key)
-	b.setPhase(key, "idle")
+	b.unbind(key, binding)
 	b.sendReply(ctx, msg, fmt.Sprintf("✅ 已关闭会话 %s", binding.DisplayName))
 }
 
@@ -259,33 +278,47 @@ func (b *Bot) handleScreenshot(ctx context.Context, tgBot *bot.Bot, update *mode
 		return
 	}
 
+	b.sendScreenshotToChat(ctx, msg.Chat.ID, msg.MessageThreadID, binding.WindowID)
+}
+
+// sendScreenshotToChat 截图并发送到 chat，附带控制键盘
+func (b *Bot) sendScreenshotToChat(ctx context.Context, chatID int64, threadID int, windowID string) {
+	kb := ScreenshotKeyboard(windowID)
+
 	// 尝试渲染截图
-	png, err := b.tmux.RenderScreenshot(binding.WindowID)
+	png, err := b.tmux.RenderScreenshot(windowID)
 	if err != nil {
 		// 降级为纯文本
 		slog.Warn("screenshot render failed, fallback to text", "error", err)
-		text, err2 := b.tmux.CapturePaneClean(binding.WindowID)
+		text, err2 := b.tmux.CapturePaneClean(windowID)
 		if err2 != nil {
-			b.sendReply(ctx, msg, fmt.Sprintf("截图失败: %v", err))
 			return
 		}
-		// 发送为代码块
 		if len(text) > 4000 {
 			text = text[len(text)-4000:]
 		}
-		b.sendReply(ctx, msg, fmt.Sprintf("```\n%s\n```", text))
+		params := &bot.SendMessageParams{
+			ChatID:      chatID,
+			Text:        fmt.Sprintf("```\n%s\n```", text),
+			ReplyMarkup: kb,
+		}
+		if threadID != 0 {
+			params.MessageThreadID = threadID
+		}
+		b.bot.SendMessage(ctx, params)
 		return
 	}
 
 	// 发送图片
 	params := &bot.SendPhotoParams{
-		ChatID: msg.Chat.ID,
-		Photo:  &models.InputFileUpload{Filename: "screenshot.png", Data: bytes.NewReader(png)},
+		ChatID:      chatID,
+		Photo:       &models.InputFileUpload{Filename: "screenshot.png", Data: bytes.NewReader(png)},
+		ReplyMarkup: kb,
 	}
-	if msg.MessageThreadID != 0 {
-		params.MessageThreadID = msg.MessageThreadID
+	if threadID != 0 {
+		params.MessageThreadID = threadID
 	}
-	tgBot.SendPhoto(ctx, params)
+	b.bot.SendPhoto(ctx, params)
 }
 
 // handleCmd /cmd 命令
@@ -388,9 +421,11 @@ func (b *Bot) handleCallback(ctx context.Context, tgBot *bot.Bot, update *models
 	cq := update.CallbackQuery
 	key := topicKeyFromCallback(cq)
 	if key == "" {
+		slog.Warn("callback: empty key, ignoring", "data", cq.Data)
 		return
 	}
 	data := cq.Data
+	slog.Info("handleCallback", "key", key, "data", data)
 
 	// Answer callback 消除加载状态
 	tgBot.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{CallbackQueryID: cq.ID})
@@ -453,17 +488,27 @@ func (b *Bot) handleCallback(ctx context.Context, tgBot *bot.Bot, update *models
 	case strings.HasPrefix(data, "kill:"):
 		windowID := strings.TrimPrefix(data, "kill:")
 		b.tmux.KillWindow(windowID)
-		b.closeSendChan(windowID)
 		// 清理所有绑定到该窗口的 binding
 		for tk, bd := range b.store.AllBindings() {
 			if bd.WindowID == windowID {
-				b.store.DeleteBinding(tk)
-				b.store.DeleteOffset(tk)
-				b.dispatcher.StopMonitor(tk)
-				b.pushers.StopPusher(tk)
+				b.unbind(tk, bd)
 			}
 		}
 		b.sendMsg(ctx, chatID, threadID, "✅ 已关闭窗口", nil)
+
+	case strings.HasPrefix(data, "ss:"):
+		// 截图控制键盘回调
+		parts := strings.SplitN(strings.TrimPrefix(data, "ss:"), ":", 2)
+		if len(parts) == 2 {
+			b.handleScreenshotAction(ctx, chatID, threadID, parts[0], parts[1])
+		}
+
+	case strings.HasPrefix(data, "nav:"):
+		// 交互式导航键盘回调
+		parts := strings.SplitN(strings.TrimPrefix(data, "nav:"), ":", 2)
+		if len(parts) == 2 {
+			b.handleNavAction(ctx, chatID, threadID, parts[0], parts[1])
+		}
 	}
 }
 
@@ -490,9 +535,13 @@ func (b *Bot) createSession(ctx context.Context, key string, chatID int64, threa
 	b.tmux.SendKeys(windowID, fmt.Sprintf("cd %s", ts.SelectedDir))
 	b.tmux.SendEnter(windowID)
 
+	// 清理可能阻止嵌套启动的环境变量
+	b.tmux.SendKeys(windowID, "unset CLAUDECODE CLAUDE_CODE 2>/dev/null; true")
+	b.tmux.SendEnter(windowID)
+
 	// 启动后端命令（bash 跳过）
 	if backendType != backend.TypeBash && be.Command != "" {
-		time.Sleep(300 * time.Millisecond) // 等待 cd 完成
+		time.Sleep(500 * time.Millisecond) // 等待 cd + unset 完成
 		cmd := be.Command
 		if len(be.Args) > 0 {
 			cmd += " " + strings.Join(be.Args, " ")
@@ -528,6 +577,12 @@ func (b *Bot) createSession(ctx context.Context, key string, chatID int64, threa
 
 // bindExisting 绑定已有窗口
 func (b *Bot) bindExisting(ctx context.Context, key string, chatID int64, threadID int, windowID string) {
+	// 检查后端是否还在运行
+	if !b.tmux.IsBackendAlive(windowID) {
+		b.sendMsg(ctx, chatID, threadID, "⚠️ 该窗口的后端进程已退出，无法绑定", nil)
+		return
+	}
+
 	// 查找窗口信息
 	windows, _ := b.tmux.ListWindows()
 	var windowName string
@@ -571,6 +626,61 @@ func (b *Bot) handleConfirm(ctx context.Context, key string, windowID string, ac
 		b.tmux.SendKeys(windowID, "!")
 		b.tmux.SendEnter(windowID)
 	}
+}
+
+// handleTopicClosed 论坛话题关闭时自动清理
+func (b *Bot) handleTopicClosed(ctx context.Context, msg *models.Message) {
+	key := topicKeyFromMessage(msg)
+	binding, ok := b.store.GetBinding(key)
+	if !ok {
+		return
+	}
+	slog.Info("topic closed, auto cleanup", "key", key, "window", binding.WindowID)
+	b.tmux.KillWindow(binding.WindowID)
+	b.unbind(key, binding)
+}
+
+// specialKeyMap maps callback action names to tmux key names
+var specialKeyMap = map[string]string{
+	"up":    "Up",
+	"down":  "Down",
+	"left":  "Left",
+	"right": "Right",
+	"enter": "Enter",
+	"esc":   "Escape",
+	"tab":   "Tab",
+	"space": "Space",
+	"ctrlc": "C-c",
+}
+
+// handleScreenshotAction 处理截图控制键盘按钮
+func (b *Bot) handleScreenshotAction(ctx context.Context, chatID int64, threadID int, action string, windowID string) {
+	if action == "y" {
+		b.tmux.SendKeys(windowID, "y")
+		b.tmux.SendEnter(windowID)
+	} else if action == "n" {
+		b.tmux.SendKeys(windowID, "n")
+		b.tmux.SendEnter(windowID)
+	} else if action != "refresh" {
+		if keyName, ok := specialKeyMap[action]; ok {
+			b.tmux.SendSpecialKey(windowID, keyName)
+		}
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	b.sendScreenshotToChat(ctx, chatID, threadID, windowID)
+}
+
+// handleNavAction 处理交互式导航键盘按钮
+func (b *Bot) handleNavAction(ctx context.Context, chatID int64, threadID int, action string, windowID string) {
+	if action != "refresh" {
+		if keyName, ok := specialKeyMap[action]; ok {
+			b.tmux.SendSpecialKey(windowID, keyName)
+		}
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	b.sendScreenshotToChat(ctx, chatID, threadID, windowID)
 }
 
 // sendMsg 发送消息到指定 chat/thread

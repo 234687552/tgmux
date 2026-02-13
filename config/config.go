@@ -45,9 +45,10 @@ type WebConfig struct {
 }
 
 type MonitorConfig struct {
-	PollInterval    time.Duration `yaml:"poll_interval"`
-	GroupThrottle   time.Duration `yaml:"group_throttle"`
-	PrivateThrottle time.Duration `yaml:"private_throttle"`
+	PollInterval       time.Duration `yaml:"poll_interval"`
+	GroupThrottle      time.Duration `yaml:"group_throttle"`
+	PrivateThrottle    time.Duration `yaml:"private_throttle"`
+	StatusPollInterval time.Duration `yaml:"status_poll_interval"`
 }
 
 type Config struct {

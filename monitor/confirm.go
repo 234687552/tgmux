@@ -33,3 +33,27 @@ func DetectConfirmPrompt(text string) bool {
 func DetectClaudeToolUse(text string) bool {
 	return strings.Contains(text, "[tool:") && (strings.Contains(text, "Allow") || strings.Contains(text, "allow"))
 }
+
+// InteractivePatterns are patterns that indicate an interactive UI (menus, selectors, etc.)
+var InteractivePatterns = []string{
+	"❯",           // Selector cursor
+	"●",           // Selected radio button
+	"○",           // Unselected radio button
+	"◉",           // Filled circle selector
+	"[ ]",         // Checkbox unchecked
+	"[x]",         // Checkbox checked
+	"[X]",         // Checkbox checked
+	"Use arrow",   // Arrow key instruction
+	"tab to cycle", // Tab instruction
+	"Esc to cancel", // Escape instruction
+}
+
+// DetectInteractiveUI checks if the text contains an interactive UI that needs navigation
+func DetectInteractiveUI(text string) bool {
+	for _, pattern := range InteractivePatterns {
+		if strings.Contains(text, pattern) {
+			return true
+		}
+	}
+	return false
+}

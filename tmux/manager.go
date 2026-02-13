@@ -74,6 +74,12 @@ func (m *Manager) SendEscape(windowID string) error {
 	return cmd.Run()
 }
 
+// SendSpecialKey 发送特殊键名（Up, Down, Left, Right, Space, Tab, C-c 等）
+func (m *Manager) SendSpecialKey(windowID string, keyName string) error {
+	cmd := exec.Command("tmux", "send-keys", "-t", m.target(windowID), keyName)
+	return cmd.Run()
+}
+
 // LoadBuffer 通过 stdin pipe 加载多行文本到 buffer，然后粘贴到窗口
 func (m *Manager) LoadBuffer(windowID string, text string) error {
 	// Step 1: load-buffer from stdin
@@ -139,6 +145,29 @@ func (m *Manager) IsWindowAlive(windowID string) bool {
 		}
 	}
 	return false
+}
+
+// PaneCommand 返回窗口当前 pane 运行的进程名（如 "node", "bash"）
+func (m *Manager) PaneCommand(windowID string) string {
+	cmd := exec.Command("tmux", "display-message", "-t", m.target(windowID), "-p", "#{pane_current_command}")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// IsBackendAlive 检查窗口中的后端进程是否还在运行（未回退到 shell）
+func (m *Manager) IsBackendAlive(windowID string) bool {
+	proc := m.PaneCommand(windowID)
+	if proc == "" {
+		return false
+	}
+	switch proc {
+	case "bash", "zsh", "sh", "fish", "dash", "ksh", "csh", "tcsh":
+		return false
+	}
+	return true
 }
 
 // SessionAlive 检查 tgmux session 是否存在

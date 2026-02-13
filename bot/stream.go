@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	tgbot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
@@ -148,7 +149,7 @@ func (p *StreamPusher) sendWithRetry(ctx context.Context, params *tgbot.SendMess
 	return nil, err
 }
 
-// editWithRetry edits a message with retry on 429
+// editWithRetry edits a message with retry on 429 and plain text fallback on format errors
 func (p *StreamPusher) editWithRetry(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error) {
 	resp, err := p.tgBot.EditMessageText(ctx, params)
 	if err == nil {
@@ -157,10 +158,18 @@ func (p *StreamPusher) editWithRetry(ctx context.Context, params *tgbot.EditMess
 
 	retryAfter := parseRetryAfter(err)
 	if retryAfter > 0 {
+		// 429: wait and retry
 		p.rateLimiter.BackOff(retryAfter)
 		if waitErr := p.rateLimiter.Wait(ctx); waitErr != nil {
 			return nil, waitErr
 		}
+		return p.tgBot.EditMessageText(ctx, params)
+	}
+
+	// Non-429 error with ParseMode set: retry as plain text
+	if params.ParseMode != "" {
+		slog.Warn("editMessageText with ParseMode failed, retrying plain text", "error", err)
+		params.ParseMode = ""
 		return p.tgBot.EditMessageText(ctx, params)
 	}
 
@@ -197,7 +206,7 @@ func (p *StreamPusher) tryMerge(first MessageTask) (MessageTask, *MessageTask) {
 	for {
 		select {
 		case next := <-p.queue:
-			if next.ContentType != first.ContentType || len(text)+len(next.Text)+2 > mergeMax {
+			if next.ContentType != first.ContentType || utf8.RuneCountInString(text)+utf8.RuneCountInString(next.Text)+2 > mergeMax {
 				// Can't merge - return overflow
 				return MessageTask{Text: text, ContentType: first.ContentType}, &next
 			}
@@ -276,7 +285,7 @@ func (p *StreamPusher) sendMessage(ctx context.Context, task MessageTask) {
 			slog.Error("sendMessage failed", "error", err)
 			return
 		}
-		slog.Info("message sent", "chat", p.chatID, "msgID", resp.ID, "textLen", len(chunk), "type", task.ContentType)
+		slog.Info("message sent", "chat", p.chatID, "thread", p.threadID, "msgID", resp.ID, "textLen", len(chunk), "type", task.ContentType)
 
 		// tool_use: record the last chunk's msg ID + text for later edit pairing
 		if task.ContentType == monitor.ContentToolUse && task.ToolUseID != "" && i == len(chunks)-1 {
@@ -297,8 +306,8 @@ func (p *StreamPusher) editToolMessage(ctx context.Context, msgID int, origText 
 		newText = escapeHTML(resultText)
 	}
 
-	if len(newText) > 4096 {
-		newText = newText[:4093] + "..."
+	if utf8.RuneCountInString(newText) > 4096 {
+		newText = truncateRunes(newText, 4093) + "..."
 	}
 
 	params := &tgbot.EditMessageTextParams{
@@ -336,13 +345,13 @@ func parseRetryAfter(err error) int {
 
 func boolPtr(b bool) *bool { return &b }
 
-// splitMessage splits text into chunks fitting Telegram's limit, preferring newline boundaries
+// splitMessage splits text into chunks fitting Telegram's limit (maxLen in runes), preferring newline boundaries
 func splitMessage(text string, maxLen int) []string {
-	if len(text) <= maxLen {
+	if utf8.RuneCountInString(text) <= maxLen {
 		return []string{text}
 	}
 	var chunks []string
-	for len(text) > maxLen {
+	for utf8.RuneCountInString(text) > maxLen {
 		splitIdx := findSplitPoint(text, maxLen)
 		chunks = append(chunks, text[:splitIdx])
 		text = text[splitIdx:]
@@ -353,17 +362,21 @@ func splitMessage(text string, maxLen int) []string {
 	return chunks
 }
 
-// findSplitPoint finds a good split point near maxLen respecting code blocks and newlines
+// findSplitPoint finds a good byte-index split point where the prefix has at most maxLen runes,
+// respecting code blocks and newlines
 func findSplitPoint(text string, maxLen int) int {
-	if maxLen >= len(text) {
+	runeCount := utf8.RuneCountInString(text)
+	if maxLen >= runeCount {
 		return len(text)
 	}
 
-	sub := text[:maxLen]
+	// Find the byte offset corresponding to maxLen runes
+	byteLimit := runeByteOffset(text, maxLen)
+	sub := text[:byteLimit]
 
-	// Look for last ``` before maxLen
+	// Look for last ``` before byteLimit
 	lastFence := strings.LastIndex(sub, "```")
-	if lastFence > maxLen/2 {
+	if lastFence > byteLimit/2 {
 		nlIdx := strings.Index(text[lastFence:], "\n")
 		if nlIdx >= 0 {
 			return lastFence + nlIdx + 1
@@ -371,13 +384,29 @@ func findSplitPoint(text string, maxLen int) int {
 		return lastFence
 	}
 
-	// Look for last newline before maxLen
+	// Look for last newline before byteLimit
 	lastNL := strings.LastIndex(sub, "\n")
-	if lastNL > maxLen/2 {
+	if lastNL > byteLimit/2 {
 		return lastNL + 1
 	}
 
-	return maxLen
+	return byteLimit
+}
+
+// runeByteOffset returns the byte index of the n-th rune in s.
+// If n >= rune count, returns len(s).
+func runeByteOffset(s string, n int) int {
+	i := 0
+	for count := 0; count < n && i < len(s); count++ {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+	}
+	return i
+}
+
+// truncateRunes returns the first n runes of s as a string.
+func truncateRunes(s string, n int) string {
+	return s[:runeByteOffset(s, n)]
 }
 
 // PusherManager manages all active StreamPushers
@@ -444,11 +473,31 @@ func (pm *PusherManager) StopAll() {
 	}
 }
 
+// HasPending checks if a pusher for the given topic has items in its queue
+func (pm *PusherManager) HasPending(topicKey string) bool {
+	pm.mu.Lock()
+	p, ok := pm.pushers[topicKey]
+	pm.mu.Unlock()
+	return ok && len(p.queue) > 0
+}
+
 // OutputHandler returns a monitor.OutputHandler that routes to the correct pusher
 func (pm *PusherManager) OutputHandler(ctx context.Context, topicKey string, chatID int64, threadID int, isPrivate bool, windowID string) monitor.OutputHandler {
 	return func(key string, content monitor.ParsedContent) {
-		// Check for confirm prompts and send keyboard
-		if monitor.DetectConfirmPrompt(content.Text) {
+		// Check for interactive UI (multi-choice menus, selectors)
+		if monitor.DetectInteractiveUI(content.Text) {
+			kb := InteractiveKeyboard(windowID)
+			params := &tgbot.SendMessageParams{
+				ChatID:      chatID,
+				Text:        "🎮 检测到交互式界面：",
+				ReplyMarkup: kb,
+			}
+			if threadID != 0 {
+				params.MessageThreadID = threadID
+			}
+			pm.tgBot.SendMessage(ctx, params)
+		} else if monitor.DetectConfirmPrompt(content.Text) {
+			// Check for simple confirm prompts (y/n)
 			kb := ConfirmKeyboard(windowID)
 			params := &tgbot.SendMessageParams{
 				ChatID:      chatID,

@@ -18,17 +18,18 @@ import (
 )
 
 type Bot struct {
-	bot        *bot.Bot
-	cfg        *config.Config
-	auth       *auth.Checker
-	store      *state.Store
-	tmux       *tmux.Manager
-	dispatcher *monitor.Dispatcher
-	pushers    *PusherManager
-	states     map[string]*TopicState
-	statesMu   sync.Mutex
-	sendChans  map[string]chan string
-	sendMu     sync.Mutex
+	bot          *bot.Bot
+	cfg          *config.Config
+	auth         *auth.Checker
+	store        *state.Store
+	tmux         *tmux.Manager
+	dispatcher   *monitor.Dispatcher
+	pushers      *PusherManager
+	statusPoller *StatusPoller
+	states       map[string]*TopicState
+	statesMu     sync.Mutex
+	sendChans    map[string]chan string
+	sendMu       sync.Mutex
 }
 
 // TopicState 管理每个 topic 的交互状态
@@ -61,6 +62,7 @@ func New(cfg *config.Config, store *state.Store, tmuxMgr *tmux.Manager, authChec
 	}
 	b.bot = tgBot
 	b.pushers = NewPusherManager(tgBot, cfg.Security.RedactSecrets)
+	b.statusPoller = NewStatusPoller(tgBot, tmuxMgr, b.pushers, store, cfg.Monitor.StatusPollInterval)
 
 	// 注册命令
 	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/new", bot.MatchTypeExact, b.handleNew)
@@ -78,6 +80,7 @@ func New(cfg *config.Config, store *state.Store, tmuxMgr *tmux.Manager, authChec
 // Start 启动 bot polling 并恢复已有绑定的监控
 func (b *Bot) Start(ctx context.Context) {
 	b.recoverBindings(ctx)
+	b.statusPoller.Start(ctx)
 	slog.Info("bot starting polling")
 	b.bot.Start(ctx)
 }
@@ -95,6 +98,13 @@ func (b *Bot) recoverBindings(ctx context.Context) {
 			slog.Info("window dead during recovery, marking disconnected", "key", key, "window", binding.WindowID)
 			binding.Status = "disconnected"
 			b.store.SetBinding(key, binding)
+			continue
+		}
+
+		if !b.tmux.IsBackendAlive(binding.WindowID) {
+			slog.Info("backend exited during recovery, removing binding", "key", key, "window", binding.WindowID)
+			b.store.DeleteBinding(key)
+			b.store.DeleteOffset(key)
 			continue
 		}
 
@@ -194,6 +204,17 @@ func parseTopicKey(key string) (chatID int64, threadID int, isPrivate bool) {
 		return chatID, 0, false
 	}
 	return 0, 0, false
+}
+
+// unbind 清理绑定及相关资源
+func (b *Bot) unbind(key string, binding state.Binding) {
+	b.store.DeleteBinding(key)
+	b.store.DeleteOffset(key)
+	b.closeSendChan(binding.WindowID)
+	b.dispatcher.StopMonitor(key)
+	b.pushers.StopPusher(key)
+	b.statusPoller.RemoveStatus(key)
+	b.setPhase(key, "idle")
 }
 
 func (b *Bot) getOrCreateState(key string) *TopicState {
