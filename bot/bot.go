@@ -149,6 +149,9 @@ func (b *Bot) authMiddleware(next bot.HandlerFunc) bot.HandlerFunc {
 // topicKey 生成绑定 key
 func topicKey(chatID int64, chatType string, threadID int) string {
 	if chatType == "private" {
+		if threadID > 0 {
+			return fmt.Sprintf("dm:%d:%d", chatID, threadID)
+		}
 		return fmt.Sprintf("dm:%d", chatID)
 	}
 	if threadID > 0 {
@@ -175,8 +178,12 @@ func topicKeyFromCallback(cq *models.CallbackQuery) string {
 // parseTopicKey 从 topicKey 中解析 chatID 和 threadID
 func parseTopicKey(key string) (chatID int64, threadID int, isPrivate bool) {
 	if strings.HasPrefix(key, "dm:") {
-		fmt.Sscanf(key, "dm:%d", &chatID)
-		return chatID, 0, true
+		// dm:{chatID} 或 dm:{chatID}:{threadID}
+		n, _ := fmt.Sscanf(key, "dm:%d:%d", &chatID, &threadID)
+		if n == 1 {
+			threadID = 0
+		}
+		return chatID, threadID, true
 	}
 	if strings.HasPrefix(key, "topic:") {
 		fmt.Sscanf(key, "topic:%d:%d", &chatID, &threadID)
