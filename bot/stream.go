@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"math/rand"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	tgbot "github.com/go-telegram/bot"
+	"github.com/go-telegram/bot/models"
 	"github.com/user/tgmux/monitor"
 	"github.com/user/tgmux/sanitize"
 )
@@ -60,6 +62,8 @@ func (r *RateLimiter) BackOff(retryAfterSec int) {
 type MessageTask struct {
 	Text        string
 	ContentType monitor.ContentType
+	ToolUseID   string // for tool_result pairing
+	ToolName    string // tool name for result stats
 }
 
 // StreamPusher sends messages to a Telegram chat via a FIFO queue.
@@ -71,9 +75,12 @@ type StreamPusher struct {
 	rateLimiter *RateLimiter
 	redact      bool
 
-	queue  chan MessageTask
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	queue      chan MessageTask
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	toolMsgIDs   map[string]int    // tool_use_id → Telegram message_id for edit pairing
+	toolNames    map[string]string // tool_use_id → tool name
+	toolMsgTexts map[string]string // tool_use_id → original sent text
 }
 
 func NewStreamPusher(chatID int64, threadID int, tgBot *tgbot.Bot, rl *RateLimiter, redact bool) *StreamPusher {
@@ -84,6 +91,9 @@ func NewStreamPusher(chatID int64, threadID int, tgBot *tgbot.Bot, rl *RateLimit
 		rateLimiter: rl,
 		redact:      redact,
 		queue:       make(chan MessageTask, 100),
+		toolMsgIDs:   make(map[string]int),
+		toolNames:    make(map[string]string),
+		toolMsgTexts: make(map[string]string),
 	}
 }
 
@@ -111,16 +121,90 @@ func (p *StreamPusher) Enqueue(task MessageTask) {
 	}
 }
 
+// sendWithRetry sends a message with HTML ParseMode, falling back to plain text on format errors, and retrying on 429
+func (p *StreamPusher) sendWithRetry(ctx context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
+	resp, err := p.tgBot.SendMessage(ctx, params)
+	if err == nil {
+		return resp, nil
+	}
+
+	retryAfter := parseRetryAfter(err)
+	if retryAfter > 0 {
+		// 429: wait and retry
+		p.rateLimiter.BackOff(retryAfter)
+		if waitErr := p.rateLimiter.Wait(ctx); waitErr != nil {
+			return nil, waitErr
+		}
+		return p.tgBot.SendMessage(ctx, params)
+	}
+
+	// Non-429 error with ParseMode set: retry as plain text
+	if params.ParseMode != "" {
+		slog.Warn("send with ParseMode failed, retrying plain text", "error", err)
+		params.ParseMode = ""
+		return p.tgBot.SendMessage(ctx, params)
+	}
+
+	return nil, err
+}
+
+// editWithRetry edits a message with retry on 429
+func (p *StreamPusher) editWithRetry(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error) {
+	resp, err := p.tgBot.EditMessageText(ctx, params)
+	if err == nil {
+		return resp, nil
+	}
+
+	retryAfter := parseRetryAfter(err)
+	if retryAfter > 0 {
+		p.rateLimiter.BackOff(retryAfter)
+		if waitErr := p.rateLimiter.Wait(ctx); waitErr != nil {
+			return nil, waitErr
+		}
+		return p.tgBot.EditMessageText(ctx, params)
+	}
+
+	return nil, err
+}
+
 func (p *StreamPusher) worker(ctx context.Context) {
 	defer p.wg.Done()
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain remaining messages
 			p.drain()
 			return
 		case task := <-p.queue:
-			p.sendMessage(ctx, task)
+			merged, overflow := p.tryMerge(task)
+			p.sendMessage(ctx, merged)
+			if overflow != nil {
+				p.sendMessage(ctx, *overflow)
+			}
+		}
+	}
+}
+
+// tryMerge attempts to merge consecutive same-type text messages from the queue
+func (p *StreamPusher) tryMerge(first MessageTask) (MessageTask, *MessageTask) {
+	// Only merge text and thinking messages
+	if first.ContentType != monitor.ContentText && first.ContentType != monitor.ContentThinking {
+		return first, nil
+	}
+
+	const mergeMax = 3800
+	text := first.Text
+
+	for {
+		select {
+		case next := <-p.queue:
+			if next.ContentType != first.ContentType || len(text)+len(next.Text)+2 > mergeMax {
+				// Can't merge - return overflow
+				return MessageTask{Text: text, ContentType: first.ContentType}, &next
+			}
+			text += "\n\n" + next.Text
+		default:
+			// No more messages in queue
+			return MessageTask{Text: text, ContentType: first.ContentType}, nil
 		}
 	}
 }
@@ -144,42 +228,113 @@ func (p *StreamPusher) sendMessage(ctx context.Context, task MessageTask) {
 		return
 	}
 
+	// tool_result: try to edit the paired tool_use message
+	if task.ContentType == monitor.ContentToolResult && task.ToolUseID != "" {
+		if msgID, ok := p.toolMsgIDs[task.ToolUseID]; ok {
+			origText := p.toolMsgTexts[task.ToolUseID]
+			delete(p.toolMsgIDs, task.ToolUseID)
+			delete(p.toolNames, task.ToolUseID)
+			delete(p.toolMsgTexts, task.ToolUseID)
+			p.editToolMessage(ctx, msgID, origText, text)
+			return
+		}
+	}
+
 	// Split long messages
 	chunks := splitMessage(text, 4096)
-	for _, chunk := range chunks {
+	for i, chunk := range chunks {
 		if err := p.rateLimiter.Wait(ctx); err != nil {
 			return
 		}
 
+		// Apply formatting based on content type
+		var parseMode models.ParseMode
+		switch task.ContentType {
+		case monitor.ContentText:
+			chunk = toHTML(chunk)
+			parseMode = models.ParseModeHTML
+		case monitor.ContentThinking:
+			// Already has HTML blockquote tags from OutputHandler
+			parseMode = models.ParseModeHTML
+		case monitor.ContentToolUse, monitor.ContentToolResult:
+			chunk = escapeHTML(chunk)
+			parseMode = models.ParseModeHTML
+		}
+
 		params := &tgbot.SendMessageParams{
-			ChatID: p.chatID,
-			Text:   chunk,
+			ChatID:             p.chatID,
+			Text:               chunk,
+			ParseMode:          parseMode,
+			LinkPreviewOptions: &models.LinkPreviewOptions{IsDisabled: boolPtr(true)},
 		}
 		if p.threadID != 0 {
 			params.MessageThreadID = p.threadID
 		}
 
-		resp, err := p.tgBot.SendMessage(ctx, params)
+		resp, err := p.sendWithRetry(ctx, params)
 		if err != nil {
-			if is429(err) {
-				p.rateLimiter.BackOff(1)
-				slog.Warn("429 on sendMessage", "chat", p.chatID)
-			} else {
-				slog.Error("sendMessage failed", "error", err)
-			}
+			slog.Error("sendMessage failed", "error", err)
 			return
 		}
 		slog.Info("message sent", "chat", p.chatID, "msgID", resp.ID, "textLen", len(chunk), "type", task.ContentType)
+
+		// tool_use: record the last chunk's msg ID + text for later edit pairing
+		if task.ContentType == monitor.ContentToolUse && task.ToolUseID != "" && i == len(chunks)-1 {
+			p.toolMsgIDs[task.ToolUseID] = resp.ID
+			p.toolNames[task.ToolUseID] = task.ToolName
+			p.toolMsgTexts[task.ToolUseID] = chunk
+		}
 	}
 }
 
-// is429 checks if error is a Telegram 429 rate limit error
-func is429(err error) bool {
-	if err == nil {
-		return false
+func (p *StreamPusher) editToolMessage(ctx context.Context, msgID int, origText string, resultText string) {
+	if err := p.rateLimiter.Wait(ctx); err != nil {
+		return
 	}
-	return strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests")
+
+	newText := origText + "\n" + escapeHTML(resultText)
+	if origText == "" {
+		newText = escapeHTML(resultText)
+	}
+
+	if len(newText) > 4096 {
+		newText = newText[:4093] + "..."
+	}
+
+	params := &tgbot.EditMessageTextParams{
+		ChatID:             p.chatID,
+		MessageID:          msgID,
+		Text:               newText,
+		ParseMode:          models.ParseModeHTML,
+		LinkPreviewOptions: &models.LinkPreviewOptions{IsDisabled: boolPtr(true)},
+	}
+
+	_, err := p.editWithRetry(ctx, params)
+	if err != nil {
+		slog.Warn("editMessageText failed, sending as new message", "error", err)
+		sendParams := &tgbot.SendMessageParams{
+			ChatID:             p.chatID,
+			Text:               escapeHTML(resultText),
+			ParseMode:          models.ParseModeHTML,
+			LinkPreviewOptions: &models.LinkPreviewOptions{IsDisabled: boolPtr(true)},
+		}
+		if p.threadID != 0 {
+			sendParams.MessageThreadID = p.threadID
+		}
+		p.sendWithRetry(ctx, sendParams)
+	}
 }
+
+// parseRetryAfter extracts RetryAfter seconds from TooManyRequestsError, returns 0 if not a 429
+func parseRetryAfter(err error) int {
+	var tooMany *tgbot.TooManyRequestsError
+	if errors.As(err, &tooMany) {
+		return tooMany.RetryAfter
+	}
+	return 0
+}
+
+func boolPtr(b bool) *bool { return &b }
 
 // splitMessage splits text into chunks fitting Telegram's limit, preferring newline boundaries
 func splitMessage(text string, maxLen int) []string {
@@ -291,9 +446,9 @@ func (pm *PusherManager) StopAll() {
 
 // OutputHandler returns a monitor.OutputHandler that routes to the correct pusher
 func (pm *PusherManager) OutputHandler(ctx context.Context, topicKey string, chatID int64, threadID int, isPrivate bool, windowID string) monitor.OutputHandler {
-	return func(key string, text string, contentType monitor.ContentType) {
+	return func(key string, content monitor.ParsedContent) {
 		// Check for confirm prompts and send keyboard
-		if monitor.DetectConfirmPrompt(text) {
+		if monitor.DetectConfirmPrompt(content.Text) {
 			kb := ConfirmKeyboard(windowID)
 			params := &tgbot.SendMessageParams{
 				ChatID:      chatID,
@@ -308,11 +463,25 @@ func (pm *PusherManager) OutputHandler(ctx context.Context, topicKey string, cha
 
 		p := pm.GetOrCreate(ctx, topicKey, chatID, threadID)
 
-		switch contentType {
+		switch content.Type {
 		case monitor.ContentThinking:
-			p.Enqueue(MessageTask{Text: "💭 " + text, ContentType: contentType})
+			formatted := "<blockquote expandable>💭 " + escapeHTML(content.Text) + "</blockquote>"
+			p.Enqueue(MessageTask{Text: formatted, ContentType: content.Type})
 		case monitor.ContentText:
-			p.Enqueue(MessageTask{Text: text, ContentType: contentType})
+			p.Enqueue(MessageTask{Text: content.Text, ContentType: content.Type})
+		case monitor.ContentToolUse:
+			p.Enqueue(MessageTask{
+				Text:        "🔧 " + content.Text,
+				ContentType: content.Type,
+				ToolUseID:   content.ToolUseID,
+				ToolName:    content.ToolName,
+			})
+		case monitor.ContentToolResult:
+			p.Enqueue(MessageTask{
+				Text:        content.Text,
+				ContentType: content.Type,
+				ToolUseID:   content.ToolUseID,
+			})
 		}
 	}
 }

@@ -17,12 +17,14 @@ import (
 type ContentType int
 
 const (
-	ContentText     ContentType = iota // 普通文本/最终答案
-	ContentThinking                    // 思考过程
+	ContentText       ContentType = iota // 普通文本/最终答案
+	ContentThinking                      // 思考过程
+	ContentToolUse                       // 工具调用
+	ContentToolResult                    // 工具结果
 )
 
 // OutputHandler 输出回调
-type OutputHandler func(topicKey string, text string, contentType ContentType)
+type OutputHandler func(topicKey string, content ParsedContent)
 
 // Monitor 输出监控接口
 type Monitor interface {

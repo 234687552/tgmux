@@ -60,6 +60,8 @@ func (b *Bot) defaultHandler(ctx context.Context, tgBot *bot.Bot, update *models
 		return
 	}
 
+	slog.Info("defaultHandler", "key", key, "phase", ts.Phase, "text", text[:min(len(text), 30)])
+
 	// 查绑定
 	binding, ok := b.store.GetBinding(key)
 	if ok {
